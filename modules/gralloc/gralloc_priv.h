@@ -37,13 +37,13 @@ struct private_handle_t;
 struct private_module_t {
     gralloc_module_t base;
 
-    private_handle_t* framebuffer;
+    struct private_handle_t* framebuffer;
     uint32_t flags;
     uint32_t numBuffers;
     uint32_t bufferMask;
     pthread_mutex_t lock;
     buffer_handle_t currentBuffer;
-    int pmem_master;
+    int gemem_master;
     void* pmem_master_base;
 
     struct fb_var_screeninfo info;
@@ -51,6 +51,8 @@ struct private_module_t {
     float xdpi;
     float ydpi;
     float fps;
+	int 	smem_start;
+	int 	vmem_start;
 };
 
 /*****************************************************************************/
@@ -61,7 +63,7 @@ struct private_handle_t : public native_handle {
 struct private_handle_t {
     struct native_handle nativeHandle;
 #endif
-    
+
     enum {
         PRIV_FLAGS_FRAMEBUFFER = 0x00000001
     };
@@ -77,9 +79,18 @@ struct private_handle_t {
     // FIXME: the attributes below should be out-of-line
     int     base;
     int     pid;
+    int     p_addr;
+    int		w;
+    int		h;
+    int		format;
+    int		alignedw;
+    int		alignedh;
+
+    void* handle;
 
 #ifdef __cplusplus
-    static const int sNumInts = 6;
+    static const int sNumInts = 12;
+
     static const int sNumFds = 1;
     static const int sMagic = 0x3141592;
 
@@ -99,7 +110,7 @@ struct private_handle_t {
         const private_handle_t* hnd = (const private_handle_t*)h;
         if (!h || h->version != sizeof(native_handle) ||
                 h->numInts != sNumInts || h->numFds != sNumFds ||
-                hnd->magic != sMagic) 
+                hnd->magic != sMagic)
         {
             LOGE("invalid gralloc handle (at %p)", h);
             return -EINVAL;

@@ -50,8 +50,8 @@ static int gralloc_map(gralloc_module_t const* module,
     private_handle_t* hnd = (private_handle_t*)handle;
     if (!(hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)) {
         size_t size = hnd->size;
-        void* mappedAddress = mmap(0, size,
-                PROT_READ|PROT_WRITE, MAP_SHARED, hnd->fd, 0);
+		void* mappedAddress = mmap(0, hnd->size,
+                PROT_READ|PROT_WRITE, MAP_SHARED, hnd->fd , (unsigned long)hnd->p_addr);
         if (mappedAddress == MAP_FAILED) {
             LOGE("Could not mmap %s", strerror(errno));
             return -errno;
@@ -82,7 +82,7 @@ static int gralloc_unmap(gralloc_module_t const* module,
 
 /*****************************************************************************/
 
-static pthread_mutex_t sMapLock = PTHREAD_MUTEX_INITIALIZER; 
+static pthread_mutex_t sMapLock = PTHREAD_MUTEX_INITIALIZER;
 
 /*****************************************************************************/
 
@@ -125,17 +125,6 @@ int mapBuffer(gralloc_module_t const* module,
     return gralloc_map(module, hnd, &vaddr);
 }
 
-int terminateBuffer(gralloc_module_t const* module,
-        private_handle_t* hnd)
-{
-    if (hnd->base) {
-        // this buffer was mapped, unmap it now
-        gralloc_unmap(module, hnd);
-    }
-
-    return 0;
-}
-
 int gralloc_lock(gralloc_module_t const* module,
         buffer_handle_t handle, int usage,
         int l, int t, int w, int h,
@@ -157,7 +146,7 @@ int gralloc_lock(gralloc_module_t const* module,
     return 0;
 }
 
-int gralloc_unlock(gralloc_module_t const* module, 
+int gralloc_unlock(gralloc_module_t const* module,
         buffer_handle_t handle)
 {
     // we're done with a software buffer. nothing to do in this

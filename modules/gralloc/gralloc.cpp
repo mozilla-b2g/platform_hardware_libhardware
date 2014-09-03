@@ -37,15 +37,21 @@
 #include "gralloc_priv.h"
 #include "gr.h"
 
+#include "ghw_allocator.h"
+#include <linux/android_pmem.h>
+
+using namespace ghw;
 /*****************************************************************************/
 
 struct gralloc_context_t {
     alloc_device_t  device;
     /* our private data here */
+    GhwMemAllocator* allocator;
+    int gemem_master;
 };
 
 static int gralloc_alloc_buffer(alloc_device_t* dev,
-        size_t size, int usage, buffer_handle_t* pHandle);
+        size_t size, int usage, buffer_handle_t* pHandle,int w,int h,int format,int stride,int hstride);
 
 /*****************************************************************************/
 
@@ -60,7 +66,7 @@ extern int gralloc_lock(gralloc_module_t const* module,
         int l, int t, int w, int h,
         void** vaddr);
 
-extern int gralloc_unlock(gralloc_module_t const* module, 
+extern int gralloc_unlock(gralloc_module_t const* module,
         buffer_handle_t handle);
 
 extern int gralloc_register_buffer(gralloc_module_t const* module,
@@ -102,7 +108,7 @@ struct private_module_t HAL_MODULE_INFO_SYM = {
 /*****************************************************************************/
 
 static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
-        size_t size, int usage, buffer_handle_t* pHandle)
+        size_t size, int usage, buffer_handle_t* pHandle,int w,int h,int format,int stride,int hstride)
 {
     private_module_t* m = reinterpret_cast<private_module_t*>(
             dev->common.module);
@@ -125,7 +131,7 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
         // we return a regular buffer which will be memcpy'ed to the main
         // screen when post is called.
         int newUsage = (usage & ~GRALLOC_USAGE_HW_FB) | GRALLOC_USAGE_HW_2D;
-        return gralloc_alloc_buffer(dev, bufferSize, newUsage, pHandle);
+        return gralloc_alloc_buffer(dev, bufferSize, newUsage, pHandle,w,h,format,stride,hstride);
     }
 
     if (bufferMask >= ((1LU<<numBuffers)-1)) {
@@ -135,6 +141,7 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
 
     // create a "fake" handles for it
     intptr_t vaddr = intptr_t(m->framebuffer->base);
+    unsigned int paddr = m->smem_start;
     private_handle_t* hnd = new private_handle_t(dup(m->framebuffer->fd), size,
             private_handle_t::PRIV_FLAGS_FRAMEBUFFER);
 
@@ -145,53 +152,82 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
             break;
         }
         vaddr += bufferSize;
+        paddr += bufferSize;
     }
-    
+
     hnd->base = vaddr;
     hnd->offset = vaddr - intptr_t(m->framebuffer->base);
+    hnd->p_addr = m->smem_start;
+    hnd->w = w;
+    hnd->h = h;
+    hnd->format = format;
+    hnd->alignedw = stride;
+    hnd->alignedh = hstride;
     *pHandle = hnd;
 
     return 0;
 }
 
 static int gralloc_alloc_framebuffer(alloc_device_t* dev,
-        size_t size, int usage, buffer_handle_t* pHandle)
+        size_t size, int usage, buffer_handle_t* pHandle,int w,int h,int format,int stride,int hstride)
 {
     private_module_t* m = reinterpret_cast<private_module_t*>(
             dev->common.module);
     pthread_mutex_lock(&m->lock);
-    int err = gralloc_alloc_framebuffer_locked(dev, size, usage, pHandle);
+    int err = gralloc_alloc_framebuffer_locked(dev, size, usage, pHandle,w,h,format,stride,hstride);
     pthread_mutex_unlock(&m->lock);
     return err;
 }
 
 static int gralloc_alloc_buffer(alloc_device_t* dev,
-        size_t size, int usage, buffer_handle_t* pHandle)
+        size_t size, int usage, buffer_handle_t* pHandle,int w,int h,int format,int stride, int hstride)
+
 {
-    int err = 0;
-    int fd = -1;
+	int pgsize = PAGE_SIZE;
+	gralloc_context_t* ctx = (gralloc_context_t*)dev;
 
-    size = roundUpToPageSize(size);
-    
-    fd = ashmem_create_region("gralloc-buffer", size);
-    if (fd < 0) {
-        LOGE("couldn't create ashmem (%s)", strerror(-errno));
-        err = -errno;
-    }
+	size = (size + pgsize) & (~(pgsize - 1));
 
-    if (err == 0) {
-        private_handle_t* hnd = new private_handle_t(fd, size, 0);
-        gralloc_module_t* module = reinterpret_cast<gralloc_module_t*>(
-                dev->common.module);
-        err = mapBuffer(module, hnd);
-        if (err == 0) {
-            *pHandle = hnd;
-        }
-    }
-    
-    LOGE_IF(err, "gralloc failed err=%s", strerror(-err));
-    
-    return err;
+	size = 2* size;
+
+	/* get memory linear memory buffers */
+	int fd_handle = open("/dev/gememalloc", O_RDWR);
+    void* v_addr = mmap(0,size,PROT_READ | PROT_WRITE,MAP_SHARED,fd_handle,0);
+
+	if(v_addr == MAP_FAILED)
+	{
+		LOGE("gralloc allocation failed for %d\n",size);
+		return -1;
+	}
+
+   // create a duplicate handles for it
+    private_handle_t* hnd = new private_handle_t(dup(fd_handle), size, 0);
+
+    u32 p_addr;
+    pmem_region PmemRegion;
+    ioctl(fd_handle, PMEM_GET_PHYS, &PmemRegion);
+	p_addr = PmemRegion.offset;
+
+//    handle->lock(p_addr,v_addr,size);
+
+
+	memset(v_addr, 0,size/2);
+	// Save the physical address in offset and p_addr of handle
+    hnd->base = (int)v_addr;
+    hnd->offset = 0;
+	hnd->p_addr = (int)p_addr;
+	hnd->w = w;
+	hnd->h =h;
+	hnd->format = format;
+	hnd->alignedw = stride;
+	hnd->alignedh = hstride;
+//	hnd->handle = (void*)handle;
+	LOGV("gralloc_alloc_buffer: Handle Values physical addr %x,	virtual addr: %x", hnd->p_addr, hnd->base + hnd->offset);
+
+	close(fd_handle);
+
+    *pHandle = hnd;
+	return 0;
 }
 
 /*****************************************************************************/
@@ -207,6 +243,9 @@ static int gralloc_alloc(alloc_device_t* dev,
 
     int align = 4;
     int bpp = 0;
+    int pad = 1;
+	unsigned int tempw	 = (w+31)&0xFFFFFFE0;
+	unsigned int temph	 = (h+31)&0xFFFFFFE0;
     switch (format) {
         case HAL_PIXEL_FORMAT_RGBA_8888:
         case HAL_PIXEL_FORMAT_RGBX_8888:
@@ -219,23 +258,48 @@ static int gralloc_alloc(alloc_device_t* dev,
         case HAL_PIXEL_FORMAT_RGB_565:
         case HAL_PIXEL_FORMAT_RGBA_5551:
         case HAL_PIXEL_FORMAT_RGBA_4444:
+			tempw	 = (w+63)&0xFFFFFFC0;
             bpp = 2;
             break;
-        default:
+        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
+        case HAL_PIXEL_FORMAT_YCbCr_420_SP:
+        case HAL_PIXEL_FORMAT_YV12:
+        case HAL_PIXEL_FORMAT_YCbCr_420_P:
+			tempw	 = (w+63)&0xFFFFFFC0;
+            bpp = 2;
+		    pad = 0;
+            break;
+		case HAL_PIXEL_FORMAT_YCbCr_422_I:
+			tempw	 = (w+63)&0xFFFFFFC0;
+			bpp = 4;
+			pad = 0;
+            break;
+	 default:
             return -EINVAL;
     }
     size_t bpr = (w*bpp + (align-1)) & ~(align-1);
+	if (!(usage & GRALLOC_USAGE_HW_FB)) {
+	bpr = (tempw*bpp + (align-1)) & ~(align-1);
+	}
     size = bpr * h;
+	if (!(usage & GRALLOC_USAGE_HW_FB)) {
+		size = bpr*temph;
+	}
     stride = bpr / bpp;
-
-    int err;
+	if(pad==0) {
+		tempw = w;
+		temph =  h;
+		stride = w;
+	}
+    int err =0;
     if (usage & GRALLOC_USAGE_HW_FB) {
-        err = gralloc_alloc_framebuffer(dev, size, usage, pHandle);
+        err = gralloc_alloc_framebuffer(dev, size, usage, pHandle,w,h,format,w,h);
     } else {
-        err = gralloc_alloc_buffer(dev, size, usage, pHandle);
+        err = gralloc_alloc_buffer(dev, size, usage, pHandle,w,h,format,stride,temph);
     }
 
     if (err < 0) {
+        LOGE("%s: err = %x",__FUNCTION__,err);
         return err;
     }
 
@@ -256,11 +320,15 @@ static int gralloc_free(alloc_device_t* dev,
                 dev->common.module);
         const size_t bufferSize = m->finfo.line_length * m->info.yres;
         int index = (hnd->base - m->framebuffer->base) / bufferSize;
-        m->bufferMask &= ~(1<<index); 
-    } else { 
-        gralloc_module_t* module = reinterpret_cast<gralloc_module_t*>(
-                dev->common.module);
-        terminateBuffer(module, const_cast<private_handle_t*>(hnd));
+        m->bufferMask &= ~(1<<index);
+    } else {
+        LOGV("gralloc_free: Free - physical addr: %x   virtual addr: %x", hnd->p_addr, hnd->base);
+
+        //GhwMemHandle* handle = (GhwMemHandle*) hnd->handle;
+
+	    //handle->release();
+	    munmap((void*)hnd->base ,hnd->size);
+
     }
 
     close(hnd->fd);
@@ -277,6 +345,10 @@ static int gralloc_close(struct hw_device_t *dev)
         /* TODO: keep a list of all buffer_handle_t created, and free them
          * all here.
          */
+         delete ctx->allocator;
+         ctx->allocator = NULL;
+         close(ctx->gemem_master);
+         ctx->gemem_master = -1;
         free(ctx);
     }
     return 0;
@@ -301,6 +373,10 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
 
         dev->device.alloc   = gralloc_alloc;
         dev->device.free    = gralloc_free;
+
+        dev->allocator = GhwMemAllocator::create(GhwMemAllocator::GHW_MEM_ALLOC_RETAIN_ONE, 4*1024*1024, 12);
+
+        dev->gemem_master = open("/dev/gememalloc", O_RDWR);
 
         *device = &dev->device.common;
         status = 0;
