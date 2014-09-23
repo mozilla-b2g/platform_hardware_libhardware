@@ -35,6 +35,7 @@
 
 #if HAVE_ANDROID_OS
 #include <linux/fb.h>
+#include <linux/kd.h>
 #endif
 
 #include "gralloc_priv.h"
@@ -143,6 +144,20 @@ int mapFrameBufferLocked(struct private_module_t* module)
     if (module->framebuffer) {
         return 0;
     }
+
+    int tty_fd = open("/dev/tty0", O_RDWR | O_SYNC);
+    if (0 > tty_fd) {
+        int err = errno;
+        LOGE("Failed to open /dev/tty0: %s(%d)\n", strerror(err), err);
+        return -err;
+    }
+    if (ioctl(tty_fd, KDSETMODE, (void*)KD_GRAPHICS)) {
+        int err = errno;
+        LOGE("Failed to set KD_GRAPHICS mode: %s(%d)\n", strerror(err), err);
+        close(tty_fd);
+        return -err;
+    }
+    close(tty_fd);
         
     char const * const device_template[] = {
             "/dev/graphics/fb%u",
